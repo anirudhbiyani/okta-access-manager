@@ -1,0 +1,246 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Setup for okta-access-manager'
+
+# Notification Email - okta@anirudhbiyani.com
+# BucketName - okta-access-manager
+# ManagedResourcePrefix - okta-access-manger
+
+# Please do not run this CloudFormation template directly, run it through deploy.sh script present in the directory.
+# There are certain variable and dependacies that are defined in there.
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Name of the S3 Bucket that holds all the script as well as YAML files.
+    Default: okta-access-manager
+  ManagedResourcePrefix:
+    Type: String
+    Description: Prefix for the managed resources
+    Default: okta-access-manager
+
+Resources:
+  YAMLS3Bucket:
+    Type: AWS::S3::Bucket
+    DependsOn: SNSTopicPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${BucketName}
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Topic: !Join
+          # !Ref arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${BucketName}
+            - ''
+            - - 'arn:'
+              - !Ref AWS::Partition
+              - ':sns:'
+              - !Ref AWS::Region
+              - ':'
+              - !Ref AWS::AccountId
+              - !Sub ":${BucketName}"
+            Event: s3:ObjectCreated:Put
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: files/
+                  - Name: suffix
+                    Value: .yaml
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+
+  LambdaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref YAMLS3Bucket
+      PolicyDocument:
+        Statement:
+          - Sid: DenyIncorrectEncryptionHeader
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: !Sub "arn:aws:s3:::${YAMLS3Bucket}/*"
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: "aws:kms"
+          - Sid: DenyUnencryptedObjectUploads
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: !Sub "arn:aws:s3:::${YAMLS3Bucket}/*"
+            Condition:
+              "Null":
+                s3:x-amz-server-side-encryption: true
+          - Sid: DenyUnsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "*"
+            Resource: !Sub "arn:aws:s3:::${YAMLS3Bucket}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  LambdaRole: # The Role that Lambda will assume to run
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ManagedResourcePrefix}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: lambda-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - ssm:DescribeParameters
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameterHistory
+                  - ssm:DescribeDocumentParameters
+                  - ssm:GetParametersByPath
+                  - ssm:GetParameters
+                  - ssm:GetParameter
+                Resource: !Sub arn:aws:ssm:*:${AWS::AccountId}:parameter/okta*
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub arn:aws:s3:::${BucketName}/*
+                  - !Sub arn:aws:s3:::${BucketName}
+              - Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kms:*
+                Resource: "*"
+
+  ManageGroupsLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return True
+      Description: Lambda that create/delete Okta Groups
+      Environment:
+        Variables:
+          BUCKET_NAME: !Sub ${BucketName}
+      FunctionName: accesss-manager-manageGroups
+      Handler: manageGroups.lambda_handler
+      MemorySize: 1024
+      PackageType: Zip
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 900
+
+  ManageMembershipLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return True
+      Description: Lambda that create/update/delete membership of Okta Groups
+      Environment:
+        Variables:
+          BUCKET_NAME: !Sub ${BucketName}
+      FunctionName: accesss-manager-manageMemberships
+      Handler: manageMembership.lambda_handler
+      MemorySize: 1024
+      PackageType: Zip
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 900
+
+  ManageMembershipLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt ManageMembershipLambdaFunction.Arn
+      Principal: sns.amazonaws.com
+
+  ManageGroupLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt ManageGroupsLambdaFunction.Arn
+      Principal: sns.amazonaws.com
+
+  EventManageMembershipLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt ManageMembershipLambdaFunction.Arn
+      Principal: events.amazonaws.com
+
+  EventManageGroupLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt ManageGroupsLambdaFunction.Arn
+      Principal: events.amazonaws.com
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub ${BucketName}
+      TopicName: !Sub ${BucketName}
+      Subscription:
+        - Protocol: lambda
+          Endpoint: !GetAtt ManageMembershipLambdaFunction.Arn
+        - Protocol: lambda
+          Endpoint: !GetAtt ManageGroupsLambdaFunction.Arn
+
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Sid: S3Access
+            Effect: Allow
+            Action:
+              - SNS:Publish
+            Principal:
+              Service:
+                - s3.amazonaws.com
+            Resource: !Ref SNSTopic
+            Condition:
+              ArnLike:
+                AWS:SourceArn: !Sub arn:aws:s3:::${BucketName}
+      Topics:
+        - !Ref SNSTopic
+
+  ScheduleEventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      ScheduleExpression: cron(30 0 * * ? *)
+      Description: Schedule Rule for YAML Access Manager
+      Targets:
+        - Arn: !GetAtt ManageGroupsLambdaFunction.Arn
+          Id: managegroups
+        - Arn: !GetAtt ManageMembershipLambdaFunction.Arn
+          Id: managemembership
